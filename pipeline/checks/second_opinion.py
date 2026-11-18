@@ -40,5 +40,79 @@ from ..model_cache import get_preds  # noqa: F401
 
 
 def run(ds, cfg, preds=None):
-    # TODO
-    raise NotImplementedError("check second_opinion chưa làm")
+    if preds is None:
+        preds = get_preds(ds, cfg, "checker")
+    so_cfg = cfg.get("second_opinion", {})
+    conf_thresh = so_cfg.get("conf", 0.25)
+    min_area_px = so_cfg.get("min_area_px", 600)
+    fp_conf = so_cfg.get("fp_conf", 0.1)
+    iou_missing = so_cfg.get("iou_missing", 0.3)
+    iou_match = so_cfg.get("iou_match", 0.5)
+    iou_loose = so_cfg.get("iou_loose", 0.5)
+    issues = []
+    for img_p in ds.image_files():
+        stem = img_p.stem
+        if stem not in preds:
+            continue
+        raw_lines = ds.read_label_lines(stem)
+        if raw_lines is None:
+            continue
+        img_size = ds.image_size(stem)
+        W, H = img_size if img_size else (1, 1)
+        raw_preds = preds.get(stem, [])
+        valid_boxes = ds.valid_boxes(stem)
+        # lọc tập dự đoán : conf >= conf_thresh& diện tích px >= min_area_px
+        P = []
+        for p in raw_preds:
+            p_cls, p_conf, pcx, pcy, pw, ph = p[0], p[1], p[2], p[3], p[4], p[5]
+            area_px = (pw * W) * (ph * H)
+            if p_conf >= conf_thresh and area_px >= min_area_px:
+                P.append((int(p_cls), float(p_conf), (pcx, pcy, pw, ph)))
+        # 1. quét từng dự đoán trong P
+        for p_cls, p_conf, p_box in P:
+            cands = []
+            for l_cls, lcx, lcy, lw, lh in valid_boxes:
+                iou = iou_xywh(p_box, (lcx, lcy, lw, lh))
+                if iou >= iou_missing:
+                    cands.append((l_cls, (lcx, lcy, lw, lh), iou))
+            if not cands:
+                issues.append(
+                    Issue("second_opinion", WARN, "POSSIBLE_MISSING", stem,
+                          "Model thấy vật mà nhãn không có box", line=None, extra={"conf": p_conf})
+                )
+            else:
+                same_class = [c for c in cands if c[0] == p_cls]
+                if same_class:
+                    best_same_iou = max(c[2] for c in same_class)
+                    if best_same_iou < iou_loose:
+                        issues.append(
+                            Issue("second_opinion", WARN, "POSSIBLE_LOOSE_BOX", stem,
+                                  f"Đúng vật, box lỏng/lệch: IoU {best_same_iou:.3f} < {iou_loose}",
+                                  line=None, extra={"conf": p_conf, "iou": best_same_iou})
+                        )
+                else:
+                    other_class = [c for c in cands if c[0] != p_cls]
+                    best_other_iou = max(c[2] for c in other_class) if other_class else 0.0
+                    if best_other_iou >= iou_match:
+                        issues.append(
+                            Issue("second_opinion", WARN, "POSSIBLE_WRONG_CLASS", stem,
+                                  f"Có thể gán nhầm lớp: IoU {best_other_iou:.3f} >= {iou_match}",
+                                  line=None, extra={"conf": p_conf, "iou": best_other_iou})
+                        )
+        # 2. quét false positive trên các nhãn hợp lệ
+        fp_preds = [p for p in raw_preds if p[1] >= fp_conf]
+        for line_no, ln_text in raw_lines:
+            try:
+                b = parse_yolo_line(ln_text)
+            except ValueError:
+                continue
+            if not (0 <= b[0] < len(ds.classes)):
+                continue
+            l_box = (b[1], b[2], b[3], b[4])
+            has_match = any(iou_xywh(l_box, (p[2], p[3], p[4], p[5])) >= iou_missing for p in fp_preds)
+            if not has_match:
+                issues.append(
+                    Issue("second_opinion", WARN, "POSSIBLE_FALSE_POS", stem,
+                          "Box nhãn không khớp vật nào model thấy", line=line_no)
+                )
+    return issues

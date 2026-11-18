@@ -34,6 +34,124 @@ import yaml  # noqa: F401
 from ..common import ERROR, parse_yolo_line  # noqa: F401
 
 
+REMOVE_IMAGE_CODES = {"DUP_IMAGE_EXACT", "DUP_IMAGE_NEAR", "LEAK_TEST", "CORRUPT_IMAGE", "BAD_SIZE"}
+DROP_LINE_CODES = {"BAD_FORMAT", "BAD_CLASS_ID", "BOX_ZERO", "DUP_BOX"}
 def fix(ds, issues, cfg):
-    # TODO
-    raise NotImplementedError("autofix chưa làm")
+    fixes = []
+    # 1.xoá ảnh hỏng, trùng, leaked
+    processed_removals = set()
+    for iss in issues:
+        if iss.severity == ERROR and iss.code in REMOVE_IMAGE_CODES:
+            stem = iss.image
+            if stem in processed_removals:
+                continue
+            processed_removals.add(stem)
+            if ds.images_dir.exists():
+                for p in ds.images_dir.iterdir():
+                    if p.stem == stem:
+                        p.unlink(missing_ok=True)
+            lbl = ds.label_path(stem)
+            if lbl.exists():
+                lbl.unlink(missing_ok=True)
+            fixes.append({
+                "image": stem,
+                "line": "",
+                "action": "remove_image",
+                "before": stem,
+                "after": "(đã xoá)",
+            })
+    # 2. Sửa tên lớp trong data.yaml
+    for iss in issues:
+        if iss.severity == ERROR and iss.code == "BAD_CLASS_NAME":
+            if ds.yaml_path.exists():
+                data = yaml.safe_load(ds.yaml_path.read_text(encoding="utf-8")) or {}
+                before = str(data.get("names", ""))
+                data["names"] = list(cfg["classes"])
+                ds.yaml_path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+                fixes.append({
+                    "image": "data.yaml",
+                    "line": "",
+                    "action": "rename_classes",
+                    "before": before,
+                    "after": str(cfg["classes"]),
+                })
+            break
+    # 3. ảnh thiếu file nhãn -> đẩy cho người gán
+    for iss in issues:
+        if iss.severity == ERROR and iss.code == "MISSING_LABEL_FILE":
+            fixes.append({
+                "image": iss.image,
+                "line": "",
+                "action": "needs_label",
+                "before": "(không có file)",
+                "after": "chuyển người gán",
+            })
+    # 4. gom lỗi cấp dòng theo ảnh
+    line_issues = defaultdict(lambda: defaultdict(list))
+    for iss in issues:
+        if iss.severity != ERROR or iss.image in processed_removals:
+            continue
+        if iss.line is not None and isinstance(iss.line, int):
+            line_issues[iss.image][iss.line].append(iss.code)
+    for stem, lines_map in line_issues.items():
+        lbl_p = ds.label_path(stem)
+        if not lbl_p.exists():
+            continue
+        orig_lines = lbl_p.read_text(encoding="utf-8", errors="replace").splitlines()
+        new_lines = []
+        for idx, orig_text in enumerate(orig_lines, 1):
+            if idx not in lines_map:
+                new_lines.append(orig_text)
+            else:
+                codes = lines_map[idx]
+                if any(c in DROP_LINE_CODES for c in codes):
+                    fixes.append({
+                        "image": stem,
+                        "line": idx,
+                        "action": "drop_line",
+                        "before": orig_text,
+                        "after": "",
+                    })
+                elif "BOX_OUT_OF_IMAGE" in codes:
+                    try:
+                        c, cx, cy, w, h = parse_yolo_line(orig_text)
+                        x1 = cx - w / 2.0
+                        x2 = cx + w / 2.0
+                        y1 = cy - h / 2.0
+                        y2 = cy + h / 2.0
+                        nx1 = max(0.0, min(1.0, x1))
+                        nx2 = max(0.0, min(1.0, x2))
+                        ny1 = max(0.0, min(1.0, y1))
+                        ny2 = max(0.0, min(1.0, y2))
+                        nw = nx2 - nx1
+                        nh = ny2 - ny1
+                        if nw <= 0 or nh <= 0:
+                            fixes.append({
+                                "image": stem,
+                                "line": idx,
+                                "action": "drop_line",
+                                "before": orig_text,
+                                "after": "",
+                            })
+                        else:
+                            ncx = (nx1 + nx2) / 2.0
+                            ncy = (ny1 + ny2) / 2.0
+                            new_line_str = f"{int(c)} {ncx:.6g} {ncy:.6g} {nw:.6g} {nh:.6g}"
+                            new_lines.append(new_line_str)
+                            fixes.append({
+                                "image": stem,
+                                "line": idx,
+                                "action": "clip_box",
+                                "before": orig_text,
+                                "after": new_line_str,
+                            })
+                    except Exception:
+                        fixes.append({
+                            "image": stem,
+                            "line": idx,
+                            "action": "drop_line",
+                            "before": orig_text,
+                            "after": "",
+                        })
+        lbl_p.write_text("\n".join(new_lines) + ("\n" if new_lines else ""), encoding="utf-8")
+    return fixes
